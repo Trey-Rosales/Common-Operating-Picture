@@ -1,4 +1,4 @@
-const { v4: uuidv4 } = require('uuid');
+const { randomUUID } = require('crypto');
 
 class CotStore {
   constructor() {
@@ -7,7 +7,7 @@ class CotStore {
 
   // Update or add a CoT entity
   update(cotJson) {
-    const entityId = cotJson.event?.$.uid || uuidv4();
+    const entityId = cotJson.event?.$.uid || randomUUID();
     const oldEntity = this.entities.get(entityId);
 
     // Save new state

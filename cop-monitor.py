@@ -51,6 +51,12 @@ COT_TYPE_STYLE = {
     "b-m": "cyan",          # marker / bits
 }
 
+SOURCE_STYLE = {
+    "peatlink":      ("bold magenta", "\u25c6 PEAT"),
+    "udp-multicast": ("bold blue",    "\u25c8 UDP "),
+    "direct":        ("bold white",   "\u25cf POST"),
+}
+
 _CONNECTED = "[bold green]\u2713[/]"   # checkmark
 _WAITING   = "[bold yellow]\u25cf[/]"  # filled circle
 _OFFLINE   = "[bold red]\u2717[/]"     # x mark
@@ -72,7 +78,7 @@ class CopMonitor:
         self.http_url = http_url
 
         self.start_time  = datetime.now()
-        self.entities    = {}       # uid -> {type, lat, lon, hae, ce, last_seen}
+        self.entities    = {}       # uid -> {type, lat, lon, hae, ce, last_seen, source}
         self.activity    = []       # list of rich-markup strings
         self.delta_count = 0
         self.ws_connected = False
@@ -80,6 +86,9 @@ class CopMonitor:
         self.ws_clients   = "?"
         self.aborted      = False
         self.lock         = threading.Lock()
+
+        # Source counters
+        self.source_counts = {"peatlink": 0, "udp-multicast": 0, "direct": 0}
 
     # ── Rich renderable protocol ────────────────────────────────────────────
 
@@ -136,6 +145,7 @@ class CopMonitor:
         tbl.add_column("Type",     ratio=2, no_wrap=True)
         tbl.add_column("Lat",      width=10, justify="right", no_wrap=True)
         tbl.add_column("Lon",      width=10, justify="right", no_wrap=True)
+        tbl.add_column("Src",      width=6,  justify="center", no_wrap=True)
         tbl.add_column("Last Seen", width=10, justify="right", no_wrap=True)
 
         with self.lock:
@@ -148,7 +158,7 @@ class CopMonitor:
         if not sorted_ents:
             tbl.add_row(
                 Text("Waiting for CoT data\u2026", style="dim italic"),
-                "", "", "", "",
+                "", "", "", "", "",
             )
         else:
             for uid, ent in sorted_ents[:20]:
@@ -159,12 +169,16 @@ class CopMonitor:
                 lat_str = f"{float(ent.get('lat', 0)):.4f}"
                 lon_str = f"{float(ent.get('lon', 0)):.4f}"
                 seen = ent.get("last_seen", "")
+                source = ent.get("source", "?")
+
+                src_style, src_label = SOURCE_STYLE.get(source, ("dim", source[:4]))
 
                 tbl.add_row(
                     Text(short_uid, style="bold"),
                     Text(cot_type, style=style),
                     Text(lat_str, style="white"),
                     Text(lon_str, style="white"),
+                    Text(src_label, style=src_style),
                     Text(seen, style="dim"),
                 )
 
@@ -208,6 +222,18 @@ class CopMonitor:
         t.append("  Entities    ", style="dim")
         t.append(f"{len(self.entities)}\n", style="bold white")
 
+        # Source breakdown
+        t.append("\n")
+        t.append("  ── Sources ──\n", style="dim")
+        for src_key, count in sorted(self.source_counts.items()):
+            if count == 0:
+                continue
+            src_style, src_label = SOURCE_STYLE.get(src_key, ("dim", src_key))
+            bar = "\u2588" * min(count, 12)
+            t.append(f"  {src_label} ", style=src_style)
+            t.append(f"{bar} ", style=src_style)
+            t.append(f"{count}\n", style=f"bold {src_style}")
+
         # Type breakdown
         type_counts = {}
         with self.lock:
@@ -217,10 +243,11 @@ class CopMonitor:
 
         if type_counts:
             t.append("\n")
+            t.append("  ── Types ──\n", style="dim")
             for prefix, count in sorted(type_counts.items()):
                 style = _style_for_type(prefix)
                 t.append(f"  {prefix:<6}", style=style)
-                bar = "\u2588" * min(count, 15)
+                bar = "\u2588" * min(count, 12)
                 t.append(f" {bar} ", style=style)
                 t.append(f"{count}\n", style=f"bold {style}")
 
@@ -246,6 +273,12 @@ class CopMonitor:
             border_style="yellow",
             box=box.ROUNDED,
         )
+
+    # ── Source tag helper ───────────────────────────────────────────────────
+
+    def _source_tag(self, source):
+        style, label = SOURCE_STYLE.get(source, ("dim", source[:6]))
+        return f"[{style}]{label}[/]"
 
     # ── WebSocket handler ───────────────────────────────────────────────────
 
@@ -273,6 +306,15 @@ class CopMonitor:
 
         self.delta_count += 1
         now_str = datetime.now().strftime("%H:%M:%S")
+        source = data.get("_source", "direct")
+
+        # Track source
+        if source in self.source_counts:
+            self.source_counts[source] += 1
+        else:
+            self.source_counts[source] = 1
+
+        src_tag = self._source_tag(source)
 
         # New entity (full object from cotStore)
         if "event" in data and "$" in data.get("event", {}):
@@ -294,13 +336,14 @@ class CopMonitor:
                 self.entities[uid] = {
                     "type": cot_type, "lat": lat, "lon": lon,
                     "hae": hae, "ce": ce, "last_seen": now_str,
+                    "source": source,
                 }
 
             style = _style_for_type(cot_type)
             short = uid[:12]
             tag = DIRECTION_NEW if is_new else DIRECTION_RECV
             self._log(
-                f"{tag}  [{style}]{cot_type}[/]  "
+                f"{tag}  {src_tag}  [{style}]{cot_type}[/]  "
                 f"uid=[bold]{short}[/]  "
                 f"{float(lat):.4f}\u00b0N {abs(float(lon)):.4f}\u00b0W"
             )
@@ -314,13 +357,14 @@ class CopMonitor:
                 if uid in self.entities:
                     self.entities[uid].update(changes)
                     self.entities[uid]["last_seen"] = now_str
+                    self.entities[uid]["source"] = source
                 else:
-                    self.entities[uid] = {**changes, "last_seen": now_str}
+                    self.entities[uid] = {**changes, "last_seen": now_str, "source": source}
 
             changed_keys = ", ".join(changes.keys())
             short = uid[:12] if uid else "?"
             self._log(
-                f"{DIRECTION_CAST}  uid=[bold]{short}[/]  "
+                f"{DIRECTION_CAST}  {src_tag}  uid=[bold]{short}[/]  "
                 f"[dim]changed:[/] {changed_keys}"
             )
 
@@ -349,6 +393,7 @@ class CopMonitor:
                                     "hae": point.get("hae", "0"),
                                     "ce": point.get("ce", "999999"),
                                     "last_seen": now_str,
+                                    "source": "sync",
                                 }
             except Exception:
                 self.http_ok = False

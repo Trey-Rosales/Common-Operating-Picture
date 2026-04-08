@@ -18,12 +18,13 @@ app.post('/cot', async (req, res) => {
   try {
     const cotXml = req.body;
     const cotJson = await parseStringPromise(cotXml);
-    
+    const source = req.headers['x-cot-source'] || 'direct';
+
     const delta = cotStore.update(cotJson);
-    
-    // Broadcast delta to WebSocket clients
-    startWsServer.broadcast(delta);
-    
+
+    // Broadcast delta to WebSocket clients (with source tag)
+    startWsServer.broadcast({ ...delta, _source: source });
+
     res.status(200).json({ status: 'ok', delta });
   } catch (err) {
     console.error(err);
