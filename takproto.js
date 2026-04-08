@@ -5,26 +5,27 @@
  * protobuf-encoded TakMessage, prefixed with a 3-byte magic header (BF 01 BF).
  * This module decodes those messages into plain CoT-like objects and encodes
  * CoT objects back into the TAK protobuf wire format.
+ *
+ * Proto definitions sourced from:
+ * https://github.com/TAK-Product-Center/Server/tree/main/src/takserver-protobuf/src/main/proto
  */
 
 const protobuf = require('protobufjs');
 
+// Official TAK protobuf schema (field numbers match TAK-Product-Center/Server)
 const PROTO_DEF = `
 syntax = "proto3";
 
 message TakMessage {
   TakControl takControl = 1;
   CotEvent cotEvent = 2;
+  uint64 submissionTime = 3;
+  uint64 creationTime = 4;
 }
 
 message TakControl {
-  string minProtoVersion = 1;
-  string maxProtoVersion = 2;
-  ContactList contactList = 3;
-}
-
-message ContactList {
-  repeated Contact contacts = 1;
+  uint32 minProtoVersion = 1;
+  uint32 maxProtoVersion = 2;
 }
 
 message CotEvent {
@@ -42,16 +43,19 @@ message CotEvent {
   double hae = 12;
   double ce = 13;
   double le = 14;
-  CotDetail detail = 15;
+  Detail detail = 15;
+  string caveat = 16;
+  string releaseableTo = 17;
 }
 
-message CotDetail {
+message Detail {
   string xmlDetail = 1;
-  repeated Contact contact = 4;
-  Group group = 5;
-  Status status = 9;
-  Takv takv = 10;
-  Track track = 11;
+  Contact contact = 2;
+  Group group = 3;
+  PrecisionLocation precisionLocation = 4;
+  Status status = 5;
+  Takv takv = 6;
+  Track track = 7;
 }
 
 message Contact {
@@ -64,15 +68,20 @@ message Group {
   string role = 2;
 }
 
+message PrecisionLocation {
+  string geopointsrc = 1;
+  string altsrc = 2;
+}
+
 message Status {
-  double battery = 1;
+  uint32 battery = 1;
 }
 
 message Takv {
   string device = 1;
-  string platform = 3;
-  string os = 4;
-  string version = 5;
+  string platform = 2;
+  string os = 3;
+  string version = 4;
 }
 
 message Track {
@@ -103,7 +112,7 @@ function decode(buf) {
     if (!e || !e.uid) return null;
 
     // Extract callsign — prefer Droid attribute from xmlDetail (ATAK's display name),
-    // then callsign from xmlDetail, then structured contact (often just "GPS")
+    // then structured contact.callsign, skipping "GPS" which ATAK uses for endpoint type
     let callsign = '';
 
     if (e.detail?.xmlDetail) {
@@ -115,9 +124,9 @@ function decode(buf) {
       }
     }
 
-    // Only fall back to structured contact if xmlDetail didn't have it
+    // Fall back to structured contact field
     if (!callsign) {
-      const structCs = e.detail?.contact?.[0]?.callsign;
+      const structCs = e.detail?.contact?.callsign;
       if (structCs && structCs !== 'GPS') callsign = structCs;
     }
 
@@ -144,11 +153,11 @@ function decode(buf) {
 
 /**
  * Encode a CoT-like object into a TAK protobuf buffer with the BF 01 BF header.
- * Input: { uid, type, callsign, lat, lon, hae, ce, le, how }
+ * Input: { uid, type, callsign, lat, lon, hae, ce, le, how, team, role }
  */
 function encode(cot) {
   const now = Date.now();
-  const stale = now + 300000; // 5 min
+  const stale = now + 120000; // 2 min stale
 
   const msg = TakMessage.create({
     cotEvent: {
@@ -164,8 +173,9 @@ function encode(cot) {
       ce:        cot.ce  || 999999,
       le:        cot.le  || 999999,
       detail: {
-        contact: [{ callsign: cot.callsign || cot.uid }],
-        group:   cot.team ? { name: cot.team, role: cot.role || 'Team Member' } : undefined,
+        xmlDetail: `<uid Droid="${cot.callsign || cot.uid}"/>`,
+        contact:   { callsign: cot.callsign || cot.uid },
+        group:     cot.team ? { name: cot.team, role: cot.role || 'Team Member' } : undefined,
       },
     },
   });
