@@ -306,7 +306,9 @@ async function forwardContactToCop(contact, source = 'peat') {
 
   peatOrigins.add(contact.uid);
 
-  // Always broadcast to UDP so ATAK gets periodic SA refreshes
+  // Always broadcast to UDP so ATAK gets periodic SA refreshes (both formats)
+  const xml = contactToXml(contact);
+  broadcastUdp(xml);
   broadcastUdpProto({
     uid:      contact.uid,
     type:     contact.cot_type || 'a-f-G-U-C',
@@ -327,8 +329,6 @@ async function forwardContactToCop(contact, source = 'peat') {
 
   console.log(`[peat→cop] ${contact.callsign || contact.uid.slice(0,12)} ${contact.cot_type || 'a-f-G-U-C'} ${contact.lat.toFixed(4)},${contact.lon.toFixed(4)}`);
 
-  const xml = contactToXml(contact);
-
   try {
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
       headers: {
@@ -347,7 +347,9 @@ async function forwardMarkerToCop(marker, source = 'peat') {
 
   peatOrigins.add(marker.id);
 
-  // Always broadcast markers to UDP (protobuf for ATAK)
+  // Always broadcast markers to UDP (both formats for ATAK)
+  const mxml = markerToXml(marker);
+  broadcastUdp(mxml);
   broadcastUdpProto({
     uid:      marker.id,
     type:     marker.cot_type || 'b-m-p-s-m',
@@ -365,10 +367,8 @@ async function forwardMarkerToCop(marker, source = 'peat') {
 
   console.log(`[peat→cop] marker "${marker.name || marker.id}" ${marker.cot_type || 'b-m-p-s-m'} ${marker.lat.toFixed(4)},${marker.lon.toFixed(4)}`);
 
-  const xml = markerToXml(marker);
-
   try {
-    await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
+    await axios.post(`${config.COP_HTTP_URL}/cot`, mxml, {
       headers: {
         'Content-Type': 'application/xml',
         'X-CoT-Source': source,
