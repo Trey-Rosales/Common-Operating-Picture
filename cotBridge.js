@@ -500,11 +500,14 @@ function forwardUpdateToPeat(update) {
 function initUdpSendSocket() {
   if (!config.UDP_ENABLED) return;
 
+  const localIp = getLocalIp();
+
   udpSendSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
   udpSendSocket.bind(() => {
     udpSendSocket.setMulticastTTL(32);
-    udpSendSocket.setBroadcast(true);
-    console.log('[udp] send socket ready');
+    udpSendSocket.setMulticastInterface(localIp);
+    udpSendSocket.setMulticastLoopback(false);
+    console.log(`[udp] send socket ready (interface: ${localIp})`);
   });
 }
 
