@@ -3,7 +3,7 @@ const axios = require('axios');
 const { Builder, parseStringPromise } = require('xml2js');
 const { randomUUID } = require('crypto');
 const dgram = require('dgram');
-const Bonjour = require('bonjour-service').Bonjour;
+const { spawn } = require('child_process');
 
 // ---------------------------------------------------------------------------
 // Configuration (env vars with defaults)
@@ -43,9 +43,49 @@ const xmlBuilder = new Builder({ headless: true });
 // mDNS discovery for PeatLink (_peatlink._tcp)
 // ---------------------------------------------------------------------------
 
-function discoverPeatLink() {
+// Get this machine's local IPv4 address (first non-loopback)
+function getLocalIp() {
+  const os = require('os');
+  const ifaces = os.networkInterfaces();
+  for (const name of Object.keys(ifaces)) {
+    for (const iface of ifaces[name]) {
+      if (iface.family === 'IPv4' && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return '127.0.0.1';
+}
+
+// Run a command and capture combined stdout+stderr, resolve on first match or timeout
+function runCapture(cmd, args, matchFn, timeoutMs) {
   return new Promise((resolve) => {
-    // If URL is explicitly configured, skip mDNS
+    const proc = spawn(cmd, args);
+    let output = '';
+    let done = false;
+
+    const finish = (result) => {
+      if (done) return;
+      done = true;
+      proc.kill();
+      resolve(result);
+    };
+
+    const onData = (data) => {
+      output += data.toString();
+      const result = matchFn(output);
+      if (result) finish(result);
+    };
+
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+    proc.on('error', () => finish(null));
+    setTimeout(() => finish(null), timeoutMs);
+  });
+}
+
+function discoverPeatLink() {
+  return new Promise(async (resolve) => {
     if (config.PEAT_WS_URL) {
       console.log(`[mdns] skipping discovery — using configured URL: ${config.PEAT_WS_URL}`);
       resolve(config.PEAT_WS_URL);
@@ -53,63 +93,96 @@ function discoverPeatLink() {
     }
 
     console.log('[mdns] browsing for _peatlink._tcp ...');
-    const bonjour = new Bonjour();
 
-    let found = false;
-    const browser = bonjour.find({ type: 'peatlink' }, (service) => {
-      if (found) return;
-      found = true;
+    const isMac = process.platform === 'darwin';
 
-      const host = service.host || service.addresses?.[0] || 'localhost';
-      // Prefer IPv4 address if available
-      const ipv4 = (service.addresses || []).find(a => a.includes('.')) || host;
-      const port = service.port;
-      const url = `ws://${ipv4}:${port}/ws`;
+    if (isMac) {
+      // Step 1: Browse — find the instance name
+      const instance = await runCapture('dns-sd', ['-B', '_peatlink._tcp', 'local.'], (out) => {
+        const m = out.match(/Add\s+\S+\s+\d+\s+(\S+)\s+_peatlink\._tcp\.\s+(.+)/);
+        return m ? m[2].trim() : null;
+      }, config.MDNS_TIMEOUT_MS);
 
-      console.log(`[mdns] found PeatLink: ${service.name} at ${ipv4}:${port}`);
-      console.log(`[mdns] resolved URL: ${url}`);
-
-      browser.stop();
-      bonjour.destroy();
-      resolve(url);
-    });
-
-    // Timeout fallback
-    setTimeout(() => {
-      if (!found) {
+      if (!instance) {
         console.log(`[mdns] no PeatLink found after ${config.MDNS_TIMEOUT_MS}ms, using fallback`);
-        browser.stop();
-        bonjour.destroy();
         resolve('ws://localhost:8090/ws');
+        return;
       }
-    }, config.MDNS_TIMEOUT_MS);
-  });
-}
 
-// Continuous background re-discovery (reconnects if PeatLink moves)
-function startMdnsWatcher() {
-  if (config.PEAT_WS_URL) return; // static URL, no watching needed
+      console.log(`[mdns] found service: ${instance}`);
 
-  const bonjour = new Bonjour();
-  const browser = bonjour.find({ type: 'peatlink' });
+      // Step 2: Lookup — get host:port
+      const hostPort = await runCapture('dns-sd', ['-L', instance, '_peatlink._tcp', 'local.'], (out) => {
+        const m = out.match(/can be reached at\s+(\S+?):(\d+)/);
+        if (m) return { host: m[1].replace(/\.$/, ''), port: parseInt(m[2], 10) };
+        return null;
+      }, 5000);
 
-  browser.on('up', (service) => {
-    const ipv4 = (service.addresses || []).find(a => a.includes('.')) || service.host;
-    const url = `ws://${ipv4}:${service.port}/ws`;
+      if (!hostPort) {
+        console.log('[mdns] could not resolve service, using fallback');
+        resolve('ws://localhost:8090/ws');
+        return;
+      }
 
-    if (url !== discoveredPeatUrl) {
-      console.log(`[mdns] PeatLink service changed: ${url}`);
-      discoveredPeatUrl = url;
-      // Reconnect if the current connection is dead
-      if (!peatWs || peatWs.readyState !== WebSocket.OPEN) {
-        connectPeat();
+      // Step 3: Resolve .local hostname to IP
+      // dns-sd -G v4 writes to stderr on macOS, so we capture both streams
+      let ip = await runCapture('dns-sd', ['-G', 'v4', hostPort.host], (out) => {
+        const m = out.match(/\s(\d+\.\d+\.\d+\.\d+)\s/);
+        return m ? m[1] : null;
+      }, 5000);
+
+      if (!ip) {
+        // .local hostname on the same machine — use our own IP
+        ip = getLocalIp();
+        console.log(`[mdns] hostname ${hostPort.host} unresolvable, using local IP: ${ip}`);
+      }
+
+      const url = `ws://${ip}:${hostPort.port}/ws`;
+      console.log(`[mdns] resolved PeatLink: ${ip}:${hostPort.port}`);
+      resolve(url);
+
+    } else {
+      // Linux: avahi-browse gives us everything in one shot
+      const result = await runCapture('avahi-browse', ['-rpt', '_peatlink._tcp'], (out) => {
+        const lines = out.split('\n');
+        for (const line of lines) {
+          if (line.startsWith('=')) {
+            const parts = line.split(';');
+            if (parts.length >= 9) {
+              return { ip: parts[7], port: parseInt(parts[8], 10) };
+            }
+          }
+        }
+        return null;
+      }, config.MDNS_TIMEOUT_MS);
+
+      if (result) {
+        const url = `ws://${result.ip}:${result.port}/ws`;
+        console.log(`[mdns] resolved PeatLink: ${result.ip}:${result.port}`);
+        resolve(url);
+      } else {
+        console.log('[mdns] no PeatLink found, using fallback');
+        resolve('ws://localhost:8090/ws');
       }
     }
   });
+}
 
-  browser.on('down', (service) => {
-    console.log(`[mdns] PeatLink service went offline: ${service.name}`);
-  });
+// Background watcher — re-discovers if PeatLink moves
+function startMdnsWatcher() {
+  if (config.PEAT_WS_URL) return;
+
+  setInterval(async () => {
+    if (peatWs && peatWs.readyState === WebSocket.OPEN) return;
+
+    console.log('[mdns] re-scanning for PeatLink ...');
+    const url = await discoverPeatLink();
+    if (url !== discoveredPeatUrl) {
+      console.log(`[mdns] PeatLink address changed: ${url}`);
+      discoveredPeatUrl = url;
+      connectPeat();
+    }
+  }, 30000);
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +541,8 @@ function connectPeat() {
         break;
 
       case 'cot_state': {
-        const { contacts = [], markers = [] } = msg.data;
+        const contacts = msg.data.contacts || [];
+        const markers  = msg.data.markers  || [];
         for (const contact of contacts) {
           forwardContactToCop(contact, 'peatlink');
         }
