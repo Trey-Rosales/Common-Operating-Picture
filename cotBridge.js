@@ -20,6 +20,7 @@ const config = {
   UDP_MULTICAST_ADDR: process.env.UDP_MULTICAST_ADDR || '239.2.3.1',
   UDP_MULTICAST_PORT: parseInt(process.env.UDP_MULTICAST_PORT || '6969', 10),
   UDP_ENABLED:        process.env.UDP_ENABLED !== '0',  // default on
+  TCP_COT_PORT:       parseInt(process.env.TCP_COT_PORT || '4242', 10),
 };
 
 // ---------------------------------------------------------------------------
@@ -33,6 +34,7 @@ const peatEntityCache = new Map();   // uid -> "lat,lon,type" — dedup PeatLink
 const copMarkersSent  = new Set();   // COP marker UIDs already forwarded
 const peatMarkersSent = new Set();   // PeatLink marker IDs already forwarded to COP
 let udpSendSocket     = null;        // separate socket for outbound multicast
+const tcpClients      = new Set();   // connected ATAK TCP clients
 
 let peatSelfId       = null;  // assigned by peat-chat on connect
 let peatRoomId       = null;  // hex room ID after join_room
@@ -306,9 +308,10 @@ async function forwardContactToCop(contact, source = 'peat') {
 
   peatOrigins.add(contact.uid);
 
-  // Always broadcast to UDP so ATAK gets periodic SA refreshes (both formats)
+  // Always broadcast so ATAK gets periodic SA refreshes (UDP + TCP)
   const xml = contactToXml(contact);
   broadcastUdp(xml);
+  broadcastTcp(xml);
   broadcastUdpProto({
     uid:      contact.uid,
     type:     contact.cot_type || 'a-f-G-U-C',
@@ -347,9 +350,10 @@ async function forwardMarkerToCop(marker, source = 'peat') {
 
   peatOrigins.add(marker.id);
 
-  // Always broadcast markers to UDP (both formats for ATAK)
+  // Always broadcast markers (UDP + TCP for ATAK)
   const mxml = markerToXml(marker);
   broadcastUdp(mxml);
+  broadcastTcp(mxml);
   broadcastUdpProto({
     uid:      marker.id,
     type:     marker.cot_type || 'b-m-p-s-m',
@@ -418,7 +422,9 @@ function forwardNewEntityToPeat(delta) {
 
   // Broadcast to UDP multicast (skip if this entity came from UDP)
   if (!udpOrigins.has(uid)) {
-    broadcastUdp(entityToXml(uid, cached));
+    const _xml = entityToXml(uid, cached);
+    broadcastUdp(_xml);
+    broadcastTcp(_xml);
     broadcastUdpProto({ uid, ...cached });
   }
 
@@ -472,7 +478,9 @@ function forwardUpdateToPeat(update) {
 
   // Broadcast updated entity to UDP multicast (skip if from UDP)
   if (!udpOrigins.has(uid)) {
-    broadcastUdp(entityToXml(uid, cached));
+    const _xml = entityToXml(uid, cached);
+    broadcastUdp(_xml);
+    broadcastTcp(_xml);
     broadcastUdpProto({ uid, ...cached });
   }
 
@@ -531,6 +539,97 @@ function broadcastUdpProto(cot) {
     });
   } catch (err) {
     console.error(`[udp] proto encode failed: ${err.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// TCP CoT server (direct connection for ATAK when multicast is blocked)
+// ---------------------------------------------------------------------------
+
+function startTcpCotServer() {
+  const net = require('net');
+  const port = config.TCP_COT_PORT;
+
+  const server = net.createServer((sock) => {
+    const addr = `${sock.remoteAddress}:${sock.remotePort}`;
+    console.log(`[tcp] ATAK connected: ${addr}`);
+    tcpClients.add(sock);
+
+    // Send current entity snapshot on connect
+    for (const [uid, ent] of copEntityCache) {
+      if (ent.lat && ent.lon && !(ent.lat === 0 && ent.lon === 0)) {
+        const xml = entityToXml(uid, ent);
+        sock.write(xml + '\n');
+      }
+    }
+
+    // Receive CoT from ATAK and forward to COP + PeatLink
+    let buffer = '';
+    sock.on('data', async (data) => {
+      buffer += data.toString();
+
+      // Extract complete <event>...</event> elements
+      let match;
+      while ((match = buffer.match(/<event[\s\S]*?<\/event>/)) !== null) {
+        const xml = match[0];
+        buffer = buffer.slice(match.index + xml.length);
+
+        try {
+          const parsed = await parseStringPromise(xml);
+          const attrs = parsed.event?.$;
+          const pointArr = parsed.event?.point;
+          const point = Array.isArray(pointArr) ? pointArr[0].$ : {};
+          if (!attrs?.uid) continue;
+
+          const uid = attrs.uid;
+          if (peatOrigins.has(uid) || copOrigins.has(uid)) continue;
+
+          const detailArr = parsed.event.detail;
+          const contactEl = detailArr?.[0]?.contact;
+          const callsign = contactEl?.[0]?.$?.callsign;
+
+          console.log(`[tcp] recv ${attrs.type} cs=${callsign || '?'} uid=${uid.slice(0, 16)} from ${addr}`);
+
+          udpOrigins.add(uid);
+
+          copEntityCache.set(uid, {
+            type:     attrs.type || 'a-f-G-U-C',
+            lat:      parseFloat(point.lat || 0),
+            lon:      parseFloat(point.lon || 0),
+            hae:      parseFloat(point.hae || 0),
+            ce:       parseFloat(point.ce || 999999),
+            le:       parseFloat(point.le || 999999),
+            callsign: callsign || uid,
+          });
+
+          await forwardUdpToCop(xml, uid);
+          forwardUdpToPeat(attrs, point, callsign);
+        } catch {}
+      }
+    });
+
+    sock.on('close', () => {
+      console.log(`[tcp] ATAK disconnected: ${addr}`);
+      tcpClients.delete(sock);
+    });
+
+    sock.on('error', (err) => {
+      console.error(`[tcp] error from ${addr}: ${err.message}`);
+      tcpClients.delete(sock);
+    });
+  });
+
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`[tcp] CoT server listening on :${port} — add ${getLocalIp()}:${port} as TCP input in ATAK`);
+  });
+}
+
+// Send CoT XML to all connected ATAK TCP clients
+function broadcastTcp(xml) {
+  for (const sock of tcpClients) {
+    if (!sock.destroyed) {
+      sock.write(xml + '\n');
+    }
   }
 }
 
@@ -860,6 +959,7 @@ async function main() {
   connectCop();
   initUdpSendSocket();
   startUdpListener();
+  startTcpCotServer();
 
   // Keep watching for PeatLink service changes
   startMdnsWatcher();
