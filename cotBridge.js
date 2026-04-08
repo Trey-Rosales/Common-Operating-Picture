@@ -4,6 +4,7 @@ const { Builder, parseStringPromise } = require('xml2js');
 const { randomUUID } = require('crypto');
 const dgram = require('dgram');
 const { spawn } = require('child_process');
+const takproto = require('./takproto');
 
 // ---------------------------------------------------------------------------
 // Configuration (env vars with defaults)
@@ -27,9 +28,11 @@ const config = {
 const peatOrigins    = new Set();   // UIDs that came from peat-chat
 const copOrigins     = new Set();   // UIDs that came from COP
 const udpOrigins     = new Set();   // UIDs that came from multicast UDP
-const copEntityCache = new Map();   // uid -> { type, lat, lon, hae, ce, le, callsign }
-const copMarkersSent = new Set();   // COP marker UIDs already forwarded
-let udpSendSocket   = null;         // separate socket for outbound multicast
+const copEntityCache  = new Map();   // uid -> { type, lat, lon, hae, ce, le, callsign }
+const peatEntityCache = new Map();   // uid -> "lat,lon,type" — dedup PeatLink cot_state repeats
+const copMarkersSent  = new Set();   // COP marker UIDs already forwarded
+const peatMarkersSent = new Set();   // PeatLink marker IDs already forwarded to COP
+let udpSendSocket     = null;        // separate socket for outbound multicast
 
 let peatSelfId       = null;  // assigned by peat-chat on connect
 let peatRoomId       = null;  // hex room ID after join_room
@@ -301,12 +304,27 @@ async function forwardContactToCop(contact, source = 'peat') {
   if (udpOrigins.has(contact.uid))            return;
   if (contact.lat === 0 && contact.lon === 0) return;
 
+  // Deduplicate — skip if position hasn't changed since last forward
+  const fingerprint = `${contact.lat},${contact.lon},${contact.cot_type}`;
+  if (peatEntityCache.get(contact.uid) === fingerprint) return;
+  peatEntityCache.set(contact.uid, fingerprint);
+
   peatOrigins.add(contact.uid);
 
   const xml = contactToXml(contact);
 
-  // Broadcast to UDP multicast so ATAK peers see PeatLink users
+  // Broadcast to UDP multicast so ATAK peers see PeatLink users (XML + protobuf)
   broadcastUdp(xml);
+  broadcastUdpProto({
+    uid:      contact.uid,
+    type:     contact.cot_type || 'a-f-G-U-C',
+    callsign: contact.callsign || contact.uid,
+    lat:      contact.lat,
+    lon:      contact.lon,
+    hae:      contact.hae || 0,
+    ce:       contact.ce  || 999999,
+    le:       999999,
+  });
 
   try {
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
@@ -323,6 +341,10 @@ async function forwardContactToCop(contact, source = 'peat') {
 async function forwardMarkerToCop(marker, source = 'peat') {
   if (copOrigins.has(marker.id)) return;
   if (udpOrigins.has(marker.id)) return;
+
+  // Markers are static — only forward once
+  if (peatMarkersSent.has(marker.id)) return;
+  peatMarkersSent.add(marker.id);
 
   peatOrigins.add(marker.id);
 
@@ -383,6 +405,7 @@ function forwardNewEntityToPeat(delta) {
   // Broadcast to UDP multicast (skip if this entity came from UDP)
   if (!udpOrigins.has(uid)) {
     broadcastUdp(entityToXml(uid, cached));
+    broadcastUdpProto({ uid, ...cached });
   }
 
   if (!peatRoomId) return;
@@ -436,6 +459,7 @@ function forwardUpdateToPeat(update) {
   // Broadcast updated entity to UDP multicast (skip if from UDP)
   if (!udpOrigins.has(uid)) {
     broadcastUdp(entityToXml(uid, cached));
+    broadcastUdpProto({ uid, ...cached });
   }
 
   if (!peatRoomId) return;
@@ -475,8 +499,22 @@ function broadcastUdp(xml) {
 
   const buf = Buffer.from(xml, 'utf-8');
   udpSendSocket.send(buf, 0, buf.length, config.UDP_MULTICAST_PORT, config.UDP_MULTICAST_ADDR, (err) => {
-    if (err) console.error(`[udp] broadcast failed: ${err.message}`);
+    if (err) console.error(`[udp] xml broadcast failed: ${err.message}`);
   });
+}
+
+// Broadcast as TAK protobuf (for ATAK devices that use mesh SA protobuf)
+function broadcastUdpProto(cot) {
+  if (!udpSendSocket || !config.UDP_ENABLED) return;
+
+  try {
+    const buf = takproto.encode(cot);
+    udpSendSocket.send(buf, 0, buf.length, config.UDP_MULTICAST_PORT, config.UDP_MULTICAST_ADDR, (err) => {
+      if (err) console.error(`[udp] proto broadcast failed: ${err.message}`);
+    });
+  } catch (err) {
+    console.error(`[udp] proto encode failed: ${err.message}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -559,8 +597,52 @@ function startUdpListener() {
   });
 
   udpSocket.on('message', async (buf, rinfo) => {
+    // Handle TAK protobuf (ATAK mesh SA — starts with BF 01 BF)
+    if (takproto.isTakProtobuf(buf)) {
+      const cot = takproto.decode(buf);
+      if (!cot || !cot.uid) return;
+      if (cot.lat === 0 && cot.lon === 0) return; // no GPS lock
+
+      const uid = cot.uid;
+      if (peatOrigins.has(uid) || copOrigins.has(uid)) return;
+
+      // Deduplicate — skip if position hasn't changed
+      const fingerprint = `${cot.lat.toFixed(6)},${cot.lon.toFixed(6)},${cot.type}`;
+      const prev = peatEntityCache.get(uid);
+      if (prev === fingerprint) return;
+      peatEntityCache.set(uid, fingerprint);
+
+      udpOrigins.add(uid);
+
+      console.log(`[udp] TAK proto ${cot.type} cs=${cot.callsign} uid=${uid.slice(0, 16)} from ${rinfo.address}`);
+
+      // Cache the entity
+      copEntityCache.set(uid, {
+        type:     cot.type,
+        lat:      cot.lat,
+        lon:      cot.lon,
+        hae:      cot.hae,
+        ce:       cot.ce,
+        le:       cot.le,
+        callsign: cot.callsign,
+      });
+
+      // Build XML for COP (COP server expects XML)
+      const xml = entityToXml(uid, copEntityCache.get(uid));
+      await forwardUdpToCop(xml, uid);
+
+      // Forward to PeatLink
+      forwardUdpToPeat(
+        { uid, type: cot.type },
+        { lat: cot.lat, lon: cot.lon, hae: cot.hae, ce: cot.ce },
+        cot.callsign
+      );
+      return;
+    }
+
+    // Handle standard CoT XML
     const xml = buf.toString('utf-8').trim();
-    if (!xml.startsWith('<')) return; // not XML
+    if (!xml.startsWith('<')) return;
 
     try {
       const parsed = await parseStringPromise(xml);
@@ -572,19 +654,21 @@ function startUdpListener() {
 
       const uid = attrs.uid;
 
-      // Skip if this UID already originated from peat or COP
       if (peatOrigins.has(uid) || copOrigins.has(uid)) return;
+
+      // Deduplicate
+      const fingerprint = `${point.lat},${point.lon},${attrs.type}`;
+      if (peatEntityCache.get(uid) === fingerprint) return;
+      peatEntityCache.set(uid, fingerprint);
 
       udpOrigins.add(uid);
 
-      // Extract callsign from <detail><contact callsign="..."/>
       const detailArr = parsed.event.detail;
       const contactEl = detailArr && detailArr[0] && detailArr[0].contact;
       const callsign  = contactEl && contactEl[0] && contactEl[0].$ && contactEl[0].$.callsign;
 
-      console.log(`[udp] received ${attrs.type || '?'} uid=${uid.slice(0, 12)} callsign=${callsign || '?'} from ${rinfo.address}`);
+      console.log(`[udp] XML ${attrs.type || '?'} cs=${callsign || '?'} uid=${uid.slice(0, 16)} from ${rinfo.address}`);
 
-      // Cache the entity
       copEntityCache.set(uid, {
         type:     attrs.type || 'a-f-G-U-C',
         lat:      parseFloat(point.lat || 0),
@@ -595,14 +679,11 @@ function startUdpListener() {
         callsign: callsign || uid,
       });
 
-      // Forward raw XML to COP
       await forwardUdpToCop(xml, uid);
-
-      // Forward parsed data to PeatLink (with callsign for display)
       forwardUdpToPeat(attrs, point, callsign);
 
     } catch (err) {
-      // Silently ignore malformed XML — common with partial UDP packets
+      // Silently ignore malformed XML
     }
   });
 
