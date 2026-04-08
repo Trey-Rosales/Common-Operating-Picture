@@ -27,8 +27,9 @@ const config = {
 const peatOrigins    = new Set();   // UIDs that came from peat-chat
 const copOrigins     = new Set();   // UIDs that came from COP
 const udpOrigins     = new Set();   // UIDs that came from multicast UDP
-const copEntityCache = new Map();   // uid -> { type, lat, lon, hae, ce, le }
+const copEntityCache = new Map();   // uid -> { type, lat, lon, hae, ce, le, callsign }
 const copMarkersSent = new Set();   // COP marker UIDs already forwarded
+let udpSendSocket   = null;         // separate socket for outbound multicast
 
 let peatSelfId       = null;  // assigned by peat-chat on connect
 let peatRoomId       = null;  // hex room ID after join_room
@@ -192,55 +193,96 @@ function startMdnsWatcher() {
 function contactToXml(contact) {
   const timeStr  = new Date(contact.time).toISOString();
   const staleStr = new Date(contact.stale).toISOString();
+  const callsign = contact.callsign || contact.uid;
 
-  return xmlBuilder.buildObject({
-    event: {
+  const event = {
+    $: {
+      uid:   contact.uid,
+      type:  contact.cot_type || 'a-f-G-U-C',
+      how:   'h-e',
+      time:  timeStr,
+      start: timeStr,
+      stale: staleStr,
+    },
+    point: {
       $: {
-        uid:   contact.uid,
-        type:  contact.cot_type || 'a-f-G-U-C',
-        how:   'h-e',
-        time:  timeStr,
-        start: timeStr,
-        stale: staleStr,
-      },
-      point: {
-        $: {
-          lat: String(contact.lat),
-          lon: String(contact.lon),
-          hae: String(contact.hae || 0),
-          ce:  String(contact.ce  || 999999),
-          le:  '999999',
-        },
+        lat: String(contact.lat),
+        lon: String(contact.lon),
+        hae: String(contact.hae || 0),
+        ce:  String(contact.ce  || 999999),
+        le:  '999999',
       },
     },
-  });
+    detail: {
+      contact: { $: { callsign } },
+    },
+  };
+
+  return xmlBuilder.buildObject({ event });
 }
 
 function markerToXml(marker) {
   const timeStr  = new Date(marker.created_at).toISOString();
   const staleStr = new Date(marker.stale).toISOString();
+  const name     = marker.name || marker.id;
 
-  return xmlBuilder.buildObject({
-    event: {
+  const event = {
+    $: {
+      uid:   marker.id,
+      type:  marker.cot_type || 'b-m-p-s-m',
+      how:   marker.how || 'h-e',
+      time:  timeStr,
+      start: timeStr,
+      stale: staleStr,
+    },
+    point: {
       $: {
-        uid:   marker.id,
-        type:  marker.cot_type || 'b-m-p-s-m',
-        how:   marker.how || 'h-e',
-        time:  timeStr,
-        start: timeStr,
-        stale: staleStr,
-      },
-      point: {
-        $: {
-          lat: String(marker.lat),
-          lon: String(marker.lon),
-          hae: String(marker.hae || 0),
-          ce:  String(marker.ce  || 999999),
-          le:  String(marker.le  || 999999),
-        },
+        lat: String(marker.lat),
+        lon: String(marker.lon),
+        hae: String(marker.hae || 0),
+        ce:  String(marker.ce  || 999999),
+        le:  String(marker.le  || 999999),
       },
     },
-  });
+    detail: {
+      contact: { $: { callsign: name } },
+      remarks: marker.remarks || '',
+    },
+  };
+
+  return xmlBuilder.buildObject({ event });
+}
+
+// Build CoT XML from a cached entity (for UDP broadcast of COP/PeatLink data)
+function entityToXml(uid, entity) {
+  const now      = new Date().toISOString();
+  const stale    = new Date(Date.now() + 300000).toISOString(); // 5 min stale
+  const callsign = entity.callsign || uid;
+
+  const event = {
+    $: {
+      uid,
+      type:  entity.type || 'a-f-G-U-C',
+      how:   'h-e',
+      time:  now,
+      start: now,
+      stale: stale,
+    },
+    point: {
+      $: {
+        lat: String(entity.lat),
+        lon: String(entity.lon),
+        hae: String(entity.hae || 0),
+        ce:  String(entity.ce  || 999999),
+        le:  String(entity.le  || 999999),
+      },
+    },
+    detail: {
+      contact: { $: { callsign } },
+    },
+  };
+
+  return xmlBuilder.buildObject({ event });
 }
 
 function cotTypeToIcon(cotType) {
@@ -261,8 +303,12 @@ async function forwardContactToCop(contact, source = 'peat') {
 
   peatOrigins.add(contact.uid);
 
+  const xml = contactToXml(contact);
+
+  // Broadcast to UDP multicast so ATAK peers see PeatLink users
+  broadcastUdp(xml);
+
   try {
-    const xml = contactToXml(contact);
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
       headers: {
         'Content-Type': 'application/xml',
@@ -280,8 +326,12 @@ async function forwardMarkerToCop(marker, source = 'peat') {
 
   peatOrigins.add(marker.id);
 
+  const xml = markerToXml(marker);
+
+  // Broadcast to UDP multicast
+  broadcastUdp(xml);
+
   try {
-    const xml = markerToXml(marker);
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
       headers: {
         'Content-Type': 'application/xml',
@@ -314,15 +364,26 @@ function forwardNewEntityToPeat(delta) {
   if (peatOrigins.has(uid)) return;
   copOrigins.add(uid);
 
+  // Extract callsign from detail if present (e.g. from direct POST)
+  const detail   = delta.event.detail;
+  const callsign = detail && detail[0] && detail[0].contact && detail[0].contact[0] && detail[0].contact[0].$.callsign;
+
   // Cache the entity
-  copEntityCache.set(uid, {
+  const cached = {
     type: cotType,
     lat:  parseFloat(point.lat),
     lon:  parseFloat(point.lon),
     hae:  parseFloat(point.hae || 0),
     ce:   parseFloat(point.ce  || 999999),
     le:   parseFloat(point.le  || 999999),
-  });
+    callsign: callsign || uid,
+  };
+  copEntityCache.set(uid, cached);
+
+  // Broadcast to UDP multicast (skip if this entity came from UDP)
+  if (!udpOrigins.has(uid)) {
+    broadcastUdp(entityToXml(uid, cached));
+  }
 
   if (!peatRoomId) return;
 
@@ -331,10 +392,10 @@ function forwardNewEntityToPeat(delta) {
       type: 'cot_position',
       data: {
         room_id:  peatRoomId,
-        lat:      parseFloat(point.lat),
-        lon:      parseFloat(point.lon),
-        hae:      parseFloat(point.hae || 0),
-        ce:       parseFloat(point.ce  || 999999),
+        lat:      cached.lat,
+        lon:      cached.lon,
+        hae:      cached.hae,
+        ce:       cached.ce,
         cot_type: cotType,
       },
     });
@@ -344,9 +405,9 @@ function forwardNewEntityToPeat(delta) {
       type: 'create_marker',
       data: {
         room_id:  peatRoomId,
-        lat:      parseFloat(point.lat),
-        lon:      parseFloat(point.lon),
-        name:     uid,
+        lat:      cached.lat,
+        lon:      cached.lon,
+        name:     cached.callsign,
         icon:     cotTypeToIcon(cotType),
         color:    '#ffff00',
         cot_type: cotType,
@@ -368,10 +429,16 @@ function forwardUpdateToPeat(update) {
   Object.assign(cached, update.changes);
   copEntityCache.set(uid, cached);
 
-  if (!peatRoomId) return;
   if (cached.lat === undefined || cached.lon === undefined) return;
 
   const cotType = cached.type || 'a-f-G-U-C';
+
+  // Broadcast updated entity to UDP multicast (skip if from UDP)
+  if (!udpOrigins.has(uid)) {
+    broadcastUdp(entityToXml(uid, cached));
+  }
+
+  if (!peatRoomId) return;
 
   if (cotType.startsWith('a-')) {
     sendToPeat({
@@ -386,6 +453,30 @@ function forwardUpdateToPeat(update) {
       },
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// UDP multicast broadcast (outbound)
+// ---------------------------------------------------------------------------
+
+function initUdpSendSocket() {
+  if (!config.UDP_ENABLED) return;
+
+  udpSendSocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+  udpSendSocket.bind(() => {
+    udpSendSocket.setMulticastTTL(32);
+    udpSendSocket.setBroadcast(true);
+    console.log('[udp] send socket ready');
+  });
+}
+
+function broadcastUdp(xml) {
+  if (!udpSendSocket || !config.UDP_ENABLED) return;
+
+  const buf = Buffer.from(xml, 'utf-8');
+  udpSendSocket.send(buf, 0, buf.length, config.UDP_MULTICAST_PORT, config.UDP_MULTICAST_ADDR, (err) => {
+    if (err) console.error(`[udp] broadcast failed: ${err.message}`);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +496,7 @@ async function forwardUdpToCop(xml, uid) {
   }
 }
 
-function forwardUdpToPeat(attrs, point) {
+function forwardUdpToPeat(attrs, point, callsign) {
   if (!peatRoomId) return;
 
   const uid     = attrs.uid;
@@ -421,9 +512,11 @@ function forwardUdpToPeat(attrs, point) {
     sendToPeat({
       type: 'cot_position',
       data: {
-        room_id:  peatRoomId,
+        room_id:     peatRoomId,
         lat, lon, hae, ce,
-        cot_type: cotType,
+        cot_type:    cotType,
+        sender_name: callsign || uid,
+        sender_id:   uid,
       },
     });
   } else if (cotType.startsWith('b-') && !copMarkersSent.has(uid)) {
@@ -431,13 +524,15 @@ function forwardUdpToPeat(attrs, point) {
     sendToPeat({
       type: 'create_marker',
       data: {
-        room_id:  peatRoomId,
+        room_id:     peatRoomId,
         lat, lon,
-        name:     uid,
-        icon:     cotTypeToIcon(cotType),
-        color:    '#ffff00',
-        cot_type: cotType,
-        remarks:  '',
+        name:        callsign || uid,
+        icon:        cotTypeToIcon(cotType),
+        color:       '#ffff00',
+        cot_type:    cotType,
+        remarks:     '',
+        sender_name: callsign || uid,
+        sender_id:   uid,
       },
     });
   }
@@ -482,13 +577,29 @@ function startUdpListener() {
 
       udpOrigins.add(uid);
 
-      console.log(`[udp] received ${attrs.type || '?'} uid=${uid.slice(0, 12)} from ${rinfo.address}`);
+      // Extract callsign from <detail><contact callsign="..."/>
+      const detailArr = parsed.event.detail;
+      const contactEl = detailArr && detailArr[0] && detailArr[0].contact;
+      const callsign  = contactEl && contactEl[0] && contactEl[0].$ && contactEl[0].$.callsign;
+
+      console.log(`[udp] received ${attrs.type || '?'} uid=${uid.slice(0, 12)} callsign=${callsign || '?'} from ${rinfo.address}`);
+
+      // Cache the entity
+      copEntityCache.set(uid, {
+        type:     attrs.type || 'a-f-G-U-C',
+        lat:      parseFloat(point.lat || 0),
+        lon:      parseFloat(point.lon || 0),
+        hae:      parseFloat(point.hae || 0),
+        ce:       parseFloat(point.ce  || 999999),
+        le:       parseFloat(point.le  || 999999),
+        callsign: callsign || uid,
+      });
 
       // Forward raw XML to COP
       await forwardUdpToCop(xml, uid);
 
-      // Forward parsed data to PeatLink
-      forwardUdpToPeat(attrs, point);
+      // Forward parsed data to PeatLink (with callsign for display)
+      forwardUdpToPeat(attrs, point, callsign);
 
     } catch (err) {
       // Silently ignore malformed XML — common with partial UDP packets
@@ -649,6 +760,7 @@ async function main() {
   // Start all connections
   connectPeat();
   connectCop();
+  initUdpSendSocket();
   startUdpListener();
 
   // Keep watching for PeatLink service changes
