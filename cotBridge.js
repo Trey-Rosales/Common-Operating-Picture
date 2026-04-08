@@ -304,17 +304,9 @@ async function forwardContactToCop(contact, source = 'peat') {
   if (udpOrigins.has(contact.uid))            return;
   if (contact.lat === 0 && contact.lon === 0) return;
 
-  // Deduplicate — skip if position hasn't changed since last forward
-  const fingerprint = `${contact.lat},${contact.lon},${contact.cot_type}`;
-  if (peatEntityCache.get(contact.uid) === fingerprint) return;
-  peatEntityCache.set(contact.uid, fingerprint);
-
   peatOrigins.add(contact.uid);
 
-  const xml = contactToXml(contact);
-
-  // Broadcast to UDP multicast so ATAK peers see PeatLink users (XML + protobuf)
-  broadcastUdp(xml);
+  // Always broadcast to UDP so ATAK gets periodic SA refreshes
   broadcastUdpProto({
     uid:      contact.uid,
     type:     contact.cot_type || 'a-f-G-U-C',
@@ -324,7 +316,18 @@ async function forwardContactToCop(contact, source = 'peat') {
     hae:      contact.hae || 0,
     ce:       contact.ce  || 999999,
     le:       999999,
+    team:     'Cyan',
+    role:     'Team Member',
   });
+
+  // Only POST to COP if position changed (dedup to avoid spamming server)
+  const fingerprint = `${contact.lat},${contact.lon},${contact.cot_type}`;
+  if (peatEntityCache.get(contact.uid) === fingerprint) return;
+  peatEntityCache.set(contact.uid, fingerprint);
+
+  console.log(`[peat→cop] ${contact.callsign || contact.uid.slice(0,12)} ${contact.cot_type || 'a-f-G-U-C'} ${contact.lat.toFixed(4)},${contact.lon.toFixed(4)}`);
+
+  const xml = contactToXml(contact);
 
   try {
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
@@ -342,16 +345,27 @@ async function forwardMarkerToCop(marker, source = 'peat') {
   if (copOrigins.has(marker.id)) return;
   if (udpOrigins.has(marker.id)) return;
 
-  // Markers are static — only forward once
+  peatOrigins.add(marker.id);
+
+  // Always broadcast markers to UDP (protobuf for ATAK)
+  broadcastUdpProto({
+    uid:      marker.id,
+    type:     marker.cot_type || 'b-m-p-s-m',
+    callsign: marker.name || marker.id,
+    lat:      marker.lat,
+    lon:      marker.lon,
+    hae:      marker.hae || 0,
+    ce:       marker.ce  || 999999,
+    le:       marker.le  || 999999,
+  });
+
+  // Only POST to COP once per marker
   if (peatMarkersSent.has(marker.id)) return;
   peatMarkersSent.add(marker.id);
 
-  peatOrigins.add(marker.id);
+  console.log(`[peat→cop] marker "${marker.name || marker.id}" ${marker.cot_type || 'b-m-p-s-m'} ${marker.lat.toFixed(4)},${marker.lon.toFixed(4)}`);
 
   const xml = markerToXml(marker);
-
-  // Broadcast to UDP multicast
-  broadcastUdp(xml);
 
   try {
     await axios.post(`${config.COP_HTTP_URL}/cot`, xml, {
