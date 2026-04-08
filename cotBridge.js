@@ -10,7 +10,7 @@ const { spawn } = require('child_process');
 // ---------------------------------------------------------------------------
 const config = {
   PEAT_WS_URL:      process.env.PEAT_WS_URL    || '',  // empty = use mDNS
-  PEAT_ROOM_NAME:   process.env.PEAT_ROOM_NAME  || 'cop-bridge',
+  PEAT_ROOM_NAME:   process.env.PEAT_ROOM_NAME  || 'general',
   COP_HTTP_URL:     process.env.COP_HTTP_URL    || 'http://localhost:3000',
   COP_WS_URL:       process.env.COP_WS_URL      || 'ws://localhost:8080',
   BRIDGE_NAME:      process.env.BRIDGE_NAME      || 'COP-Bridge',
